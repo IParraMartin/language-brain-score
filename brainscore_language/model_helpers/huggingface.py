@@ -141,7 +141,7 @@ class HuggingfaceSubject(ArtificialSubject):
             hooks, layer_representations = self._setup_hooks()
 
             # run and remove hooks
-            with torch.no_grad():
+            with self._forward_context():
                 if _use_kv and _past_kv is not None:
                     # Slide the KV cache if adding new tokens would exceed the model's context window.
                     # Drop the oldest entries so the cache stays at max_position_embeddings - new_len,
@@ -185,6 +185,8 @@ class HuggingfaceSubject(ArtificialSubject):
                         [_last_logit.to(base_output.logits.device), base_output.logits], dim=1)
                 else:
                     base_output = self.basemodel(**context_tokens, use_cache=_use_kv)
+
+            self._post_forward(base_output, layer_representations)
 
             # Update KV cache state after each step
             if _use_kv:
@@ -379,6 +381,30 @@ class HuggingfaceSubject(ArtificialSubject):
         # this is not caught in the current implementation.
         next_word = next_word.strip()
         return next_word
+
+    def _forward_context(self):
+        """Returns the context manager wrapping the model forward pass.
+
+        Subclasses can override this to change gradient tracking behaviour.
+        The default disables gradient computation for efficiency.
+
+        Returns:
+            A context manager (torch.no_grad by default).
+        """
+        return torch.no_grad()
+
+    def _post_forward(self, base_output, layer_representations: dict) -> None:
+        """Called immediately after the forward pass, before hook removal.
+
+        Subclasses can override this to perform operations that require the
+        computation graph built during the forward pass (e.g., a backward
+        pass for gradient-based saliency). The base implementation is a no-op.
+
+        Args:
+            base_output: The raw CausalLMOutput returned by the base model.
+            layer_representations: Ordered dict mapping hook keys to the
+                activation tensors captured by the forward hooks.
+        """
 
     def _get_layer(self, layer_name: str) -> torch.nn.Module:
         SUBMODULE_SEPARATOR = '.'
