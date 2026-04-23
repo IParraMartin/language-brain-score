@@ -239,3 +239,173 @@ SaliencyHuggingfaceSubject(
 | Cache clearing before and after backward | MPS and CUDA hold freed allocations in a cache. Clearing before backward frees headroom; clearing after releases the computation graph immediately rather than waiting for Python GC, preventing accumulation across the 200+ text parts in a typical benchmark. |
 | Hooks fire twice with gradient checkpointing | The second firing (during backward recomputation) overwrites the dict with the tensor that is live in the backward graph — which is exactly the tensor whose `.grad` is populated. This is the correct behaviour: the saliency is computed on the same activations that determined the gradient. |
 | Same `NeuroidAssembly` coordinate structure | The saliency vector has identical shape and coordinates to a raw hidden state, so all existing metrics, benchmarks, and ceiling computations work without any modification. |
+
+---
+
+## Experiment 1: Results
+
+| Model | Score (ceiling-normalised) |
+|---|---|
+| `gpt2` (raw activations, layer 11) | 0.87 |
+| `gpt2-saliency` (GradCAM, layer 11, last token) | 0.50 |
+
+The 37-point drop shows that the GradCAM product is actively discarding information that predicts brain activity. Units with small `dS/dh` (unimportant for next-token prediction) are still metabolically active and neurally relevant — saliency zeroes them out.
+
+The core tension is that BOLD signal reflects metabolic demand (∝ activation magnitude), while `dS/dh` reflects causal sensitivity (which units matter *if perturbed*). These are different quantities. Multiplying them together does not straightforwardly model blood flow; instead it selects for units that are both active *and* causally relevant to the next-token objective.
+
+---
+
+## Experiment 2: Disentanglement and Ablations
+
+To understand where the gap comes from, Experiment 1 is extended with a set of ablations that independently vary (1) which gradient-based representation is extracted, (2) how the representation is pooled over the sequence, and (3) which scalar S drives the backward pass.
+
+### New parameters in `SaliencyHuggingfaceSubject`
+
+Three new constructor arguments were added. All existing defaults are preserved.
+
+#### `mode` — representation type
+
+Controls what is extracted from the hidden state and its gradient:
+
+```python
+# GradCAM product (original, default)
+mode='gradcam'       →   h ⊙ (dS/dh)
+
+# Raw gradient — causal sensitivity only, no activation weighting
+mode='gradient'      →   dS/dh
+
+# Unsigned gradient — influence magnitude without sign
+mode='abs_gradient'  →   |dS/dh|
+```
+
+If `mode='gradient'` scores near 0%, the gradient alone carries no brain signal; the 50% result is explained by the activation component. If it scores high, sensitivity to the generative objective is itself brain-predictive.
+
+#### `token_pool` — sequence aggregation
+
+Controls which token positions contribute to the sentence-level vector:
+
+```python
+# Final token only (original, default) — matches raw-activation convention
+token_pool='last'    →   rep[:, -1, :]
+
+# Average across all positions — treats every token equally
+token_pool='mean'    →   rep.mean(dim=1)
+```
+
+The default last-token choice is a strong assumption: the model's internal state at the end of a sentence is used to represent the whole sentence. Mean-pooling tests whether a whole-sequence representation is more aligned with the brain's sentence-level fMRI response.
+
+#### `scalar_mode` — scalar S
+
+Selects the quantity whose gradient is computed:
+
+```python
+# Log-prob of greedy next token at last position (original, default)
+scalar_mode='next_token'
+
+# Sum of greedy log-probs across all sequence positions
+scalar_mode='sentence_surprisal'
+```
+
+With `'sentence_surprisal'`, the gradient flows back through every token position rather than being concentrated at the last one. This gives a richer, sentence-wide sensitivity map and is conceptually closer to a whole-sentence processing signal.
+
+**Implementation of `sentence_surprisal` in `_compute_scalar`:**
+
+```python
+logits    = base_output.logits[0]                                     # (seq_len, vocab_size)
+log_probs = torch.log_softmax(logits, dim=-1)
+greedy_ids = logits.argmax(dim=-1)                                    # (seq_len,)
+return log_probs[torch.arange(len(logits), device=logits.device),
+                 greedy_ids].sum()
+```
+
+The `argmax` is used only as an index; the gradient flows through `log_probs` (via `log_softmax`) to every position's logits and then to the hidden states.
+
+**Implementation of the two-step extraction in `output_to_representations`:**
+
+```python
+# Step 1 — select representation
+if self._mode == 'gradcam':
+    rep = tensor * tensor.grad          # h ⊙ (dS/dh)
+elif self._mode == 'gradient':
+    rep = tensor.grad                   # dS/dh
+else:  # 'abs_gradient'
+    rep = tensor.grad.abs()             # |dS/dh|
+
+# Step 2 — pool over sequence positions
+if self._token_pool == 'mean':
+    rep = rep.mean(dim=1, keepdim=True)
+else:  # 'last'
+    rep = rep[:, -1:, :]
+```
+
+---
+
+### New registered models
+
+#### Disentanglement (layer 11, last token, next-token scalar)
+
+```python
+model_registry['gpt2-gradient']      # mode='gradient'
+model_registry['gpt2-abs-gradient']  # mode='abs_gradient'
+```
+
+#### Token-pooling ablation
+
+```python
+model_registry['gpt2-mean-saliency']  # token_pool='mean'
+```
+
+#### Scalar ablation
+
+```python
+model_registry['gpt2-surprisal-saliency']  # scalar_mode='sentence_surprisal'
+```
+
+#### Layer sweep (GradCAM, last token, next-token scalar)
+
+```python
+model_registry['gpt2-saliency-layer0']   # transformer.h.0
+model_registry['gpt2-saliency-layer1']   # transformer.h.1
+...
+model_registry['gpt2-saliency-layer11']  # transformer.h.11  (same as gpt2-saliency)
+```
+
+---
+
+### Running the ablations
+
+**CLI:**
+
+```bash
+python brainscore_language score --model_identifier=gpt2-gradient --benchmark_identifier=Pereira2018.243sentences-linear
+python brainscore_language score --model_identifier=gpt2-abs-gradient --benchmark_identifier=Pereira2018.243sentences-linear
+python brainscore_language score --model_identifier=gpt2-mean-saliency --benchmark_identifier=Pereira2018.243sentences-linear
+python brainscore_language score --model_identifier=gpt2-surprisal-saliency --benchmark_identifier=Pereira2018.243sentences-linear
+python brainscore_language score --model_identifier=gpt2-saliency-layer5 --benchmark_identifier=Pereira2018.243sentences-linear
+```
+
+**Programmatic layer sweep:**
+
+```python
+from brainscore_language import load_benchmark, load_model
+
+benchmark = load_benchmark("Pereira2018.243sentences-linear")
+
+results = {}
+for layer in range(12):
+    model = load_model(f"gpt2-saliency-layer{layer}")
+    results[layer] = benchmark(model).values
+    print(f"layer {layer:2d}: {results[layer]:.4f}")
+```
+
+---
+
+### Design decisions for Experiment 2
+
+| Decision | Rationale |
+|---|---|
+| Three modes rather than three separate classes | A single `mode` parameter keeps the public API minimal and avoids duplicating the `__init__`, `_forward_context`, `_post_forward`, and `_register_hook` logic. All three modes share the same backward pass. |
+| `'last'` remains the default for `token_pool` | Preserves backward compatibility with `gpt2-saliency` results from Experiment 1 and matches the raw-activation convention in `HuggingfaceSubject`. |
+| Sentence surprisal sums greedy log-probs, not actual next-token log-probs | Actual next-token log-probs require the input token IDs, which are not passed to `scalar_fn`. Using greedy predictions is self-contained, always differentiable, and provides the same sentence-wide gradient flow. |
+| Layer sweep registered as individual models | Each layer gets its own registry entry so it can be scored independently via the CLI with no code changes, and results are cached separately per layer. |
+| `ValueError` on unknown `mode` / `token_pool` | Fails loudly at representation-extraction time rather than silently producing a wrong result. |

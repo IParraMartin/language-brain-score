@@ -3,7 +3,6 @@ from typing import List
 
 from brainscore_core.supported_data_standards.brainio.assemblies import walk_coords, array_is_element, DataAssembly
 
-
 def ci_error(samples, center, confidence=.95):
     low, high = 100 * ((1 - confidence) / 2), 100 * (1 - ((1 - confidence) / 2))
     confidence_below, confidence_above = np.nanpercentile(samples, low), np.nanpercentile(samples, high)
