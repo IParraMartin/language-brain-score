@@ -270,7 +270,7 @@ class SaliencyHuggingfaceSubject(HuggingfaceSubject):
 
         .. code-block:: text
 
-            gradcam      →  h ⊙ (dS/dh)          element-wise product
+            gradcam      →  h \odot (dS/dh)          element-wise product
             gradient     →  dS/dh                  raw gradient
             abs_gradient →  |dS/dh|                unsigned gradient magnitude
 
@@ -318,7 +318,7 @@ class SaliencyHuggingfaceSubject(HuggingfaceSubject):
             # --- Step 1: select representation based on mode ---
             if self._mode == 'gradcam':
                 # GradCAM product: large only where activation AND gradient are large
-                rep = tensor * tensor.grad              # h ⊙ (dS/dh)
+                rep = tensor * tensor.grad              # h \odot (dS/dh)
             elif self._mode == 'gradient':
                 # Raw gradient: causal sensitivity irrespective of activation magnitude
                 rep = tensor.grad                       # dS/dh
